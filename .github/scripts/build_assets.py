@@ -360,6 +360,7 @@ def build_common_assets(sources: dict, common: Path, upstream: Path) -> dict[str
         input_names=["image"],
         output_names=["grid2d", "grid3d"],
         opset_version=16,
+        external_data=False,
     )
     register_source(common_source_urls, uvdoc_model_path, uvdoc_model_url)
 
