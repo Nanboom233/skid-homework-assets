@@ -159,7 +159,10 @@ jobs:
               }
               if path in fixed:
                   return fixed[path]
-              if path.startswith("onnxruntime/windows/DirectML"):
+              if path in {
+                  "onnxruntime/windows/DirectML.dll",
+                  "onnxruntime/windows/LICENSE-directml",
+              }:
                   return DIRECTML_NUPKG_URL
               if path.startswith("onnxruntime/windows/"):
                   return ORT_DML_NUPKG_URL
