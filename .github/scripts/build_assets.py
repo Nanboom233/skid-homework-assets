@@ -10,7 +10,7 @@ import tarfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import unquote, urlparse
 from urllib.request import urlretrieve
 
 
@@ -170,22 +170,16 @@ def download_package(url: str, upstream: Path, fallback_name: str) -> Path:
     return package_path
 
 
-def google_drive_file_id(url: str) -> str | None:
+def is_google_drive_url(url: str) -> bool:
     parsed = urlparse(url)
-    query_id = parse_qs(parsed.query).get("id")
-    if query_id and query_id[0]:
-        return query_id[0]
-    if "/file/d/" in parsed.path:
-        return parsed.path.split("/file/d/", 1)[1].split("/", 1)[0] or None
-    return None
+    return parsed.netloc.lower().endswith("drive.google.com")
 
 
 def download_google_drive_or_url(url: str, path: Path) -> None:
-    file_id = google_drive_file_id(url)
-    if file_id:
+    if is_google_drive_url(url):
         path.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(
-            [sys.executable, "-m", "gdown", "--id", file_id, "-O", str(path)],
+            [sys.executable, "-m", "gdown", url, "-O", str(path)],
             check=True,
         )
         return
