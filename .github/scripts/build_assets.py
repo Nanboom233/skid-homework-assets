@@ -8,8 +8,88 @@ import subprocess
 import sys
 import tarfile
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import urlretrieve
+
+
+docaligner_model_path = "models/docaligner-fastvit_sa24.onnx"
+docaligner_license_path = "models/LICENSE-docaligner"
+uvdoc_model_path = "models/uvdoc-best-model.onnx"
+uvdoc_license_path = "models/LICENSE-uvdoc"
+models_readme_path = "models/README.md"
+
+windows_platform = "windows-directml"
+linux_platform = "linux-tensorrt-cuda"
+
+windows_ort_readme_fallback = (
+    "Windows ONNX Runtime DirectML files are extracted from "
+    "Microsoft.ML.OnnxRuntime.DirectML and Microsoft.AI.DirectML NuGet packages.\n"
+)
+linux_ort_readme_fallback = (
+    "Linux ONNX Runtime GPU files are extracted from the official "
+    "Microsoft ONNX Runtime GitHub Release asset.\n"
+)
+
+
+@dataclass(frozen=True)
+class ZipMember:
+    archive_path: str
+    output_path: str
+    required: bool = True
+
+
+@dataclass(frozen=True)
+class TarMember:
+    archive_suffix: str
+    output_path: str
+    required: bool = True
+
+
+windows_onnxruntime_members = (
+    ZipMember("runtimes/win-x64/native/onnxruntime.dll", "onnxruntime/windows/onnxruntime.dll"),
+    ZipMember(
+        "runtimes/win-x64/native/onnxruntime_providers_shared.dll",
+        "onnxruntime/windows/onnxruntime_providers_shared.dll",
+    ),
+    ZipMember("README.md", "onnxruntime/windows/README.md", required=False),
+    ZipMember("LICENSE", "onnxruntime/windows/LICENSE-onnxruntime", required=False),
+    ZipMember(
+        "ThirdPartyNotices.txt",
+        "onnxruntime/windows/ThirdPartyNotices-onnxruntime.txt",
+        required=False,
+    ),
+)
+windows_directml_members = (
+    ZipMember("bin/x64-win/DirectML.dll", "onnxruntime/windows/DirectML.dll"),
+    ZipMember("LICENSE", "onnxruntime/windows/LICENSE-directml", required=False),
+)
+linux_onnxruntime_members = (
+    TarMember("lib/libonnxruntime.so", "onnxruntime/linux/libonnxruntime.so"),
+    TarMember("lib/libonnxruntime.so.1", "onnxruntime/linux/libonnxruntime.so.1"),
+    TarMember("lib/libonnxruntime.so.1.24.4", "onnxruntime/linux/libonnxruntime.so.1.24.4"),
+    TarMember(
+        "lib/libonnxruntime_providers_shared.so",
+        "onnxruntime/linux/libonnxruntime_providers_shared.so",
+    ),
+    TarMember(
+        "lib/libonnxruntime_providers_cuda.so",
+        "onnxruntime/linux/libonnxruntime_providers_cuda.so",
+    ),
+    TarMember(
+        "lib/libonnxruntime_providers_tensorrt.so",
+        "onnxruntime/linux/libonnxruntime_providers_tensorrt.so",
+    ),
+    TarMember("LICENSE", "onnxruntime/linux/LICENSE-onnxruntime", required=False),
+    TarMember(
+        "ThirdPartyNotices.txt",
+        "onnxruntime/linux/ThirdPartyNotices-onnxruntime.txt",
+        required=False,
+    ),
+    TarMember("Privacy.md", "onnxruntime/linux/Privacy.md", required=False),
+    TarMember("README.md", "onnxruntime/linux/README.md", required=False),
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,16 +112,26 @@ def require_mapping(value: object, name: str) -> dict:
     return value
 
 
-def require_list(value: object, name: str) -> list:
-    if not isinstance(value, list):
-        raise TypeError(f"{name} must be an array.")
-    return value
-
-
 def require_str(value: object, name: str) -> str:
     if not isinstance(value, str) or not value:
         raise TypeError(f"{name} must be a non-empty string.")
     return value
+
+
+def source_url(value: object, name: str) -> str:
+    if isinstance(value, str):
+        return require_str(value, name)
+    source = require_mapping(value, name)
+    return require_str(source.get("url"), f"{name}.url")
+
+
+def get_source_url(sources: dict, *keys: str) -> str:
+    value: object = sources
+    path_parts = []
+    for key in keys:
+        path_parts.append(key)
+        value = require_mapping(value, ".".join(path_parts[:-1]) or "sources").get(key)
+    return source_url(value, ".".join(("sources", *keys)))
 
 
 def reset_dir(path: Path) -> None:
@@ -68,24 +158,48 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def install_python_packages(manifest: dict) -> None:
-    python_config = require_mapping(manifest.get("python"), "python")
-    packages = require_list(python_config.get("packages"), "python.packages")
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--upgrade", "pip"],
-        check=True,
-    )
-    for package in packages:
-        command = [sys.executable, "-m", "pip", "install"]
-        if isinstance(package, str):
-            command.append(package)
-        else:
-            package_config = require_mapping(package, "python.packages[]")
-            index_url = package_config.get("indexUrl")
-            if index_url is not None:
-                command.extend(["--index-url", require_str(index_url, "indexUrl")])
-            command.append(require_str(package_config.get("name"), "name"))
-        subprocess.run(command, check=True)
+def register_source(source_urls: dict[str, str], output_path: str, source_url_value: str) -> None:
+    source_urls[output_path] = source_url_value
+
+
+def download_package(url: str, upstream: Path, fallback_name: str) -> Path:
+    parsed = urlparse(url)
+    basename = Path(unquote(parsed.path)).name or fallback_name
+    package_path = upstream / basename
+    download(url, package_path)
+    return package_path
+
+
+def google_drive_file_id(url: str) -> str | None:
+    parsed = urlparse(url)
+    query_id = parse_qs(parsed.query).get("id")
+    if query_id and query_id[0]:
+        return query_id[0]
+    if "/file/d/" in parsed.path:
+        return parsed.path.split("/file/d/", 1)[1].split("/", 1)[0] or None
+    return None
+
+
+def download_google_drive_or_url(url: str, path: Path) -> None:
+    file_id = google_drive_file_id(url)
+    if file_id:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            [sys.executable, "-m", "gdown", "--id", file_id, "-O", str(path)],
+            check=True,
+        )
+        return
+    download(url, path)
+
+
+def download_to_package(
+    url: str,
+    package_root: Path,
+    output_path: str,
+    source_urls: dict[str, str],
+) -> None:
+    download(url, package_root / output_path)
+    register_source(source_urls, output_path, url)
 
 
 def copy_tree(source: Path, destination: Path) -> None:
@@ -102,18 +216,15 @@ def zip_member(zf: zipfile.ZipFile, requested: str) -> str:
     raise RuntimeError(f"Missing expected zip member: {requested}")
 
 
-def copy_zip_member(archive: Path, member: dict, package_root: Path) -> bool:
-    archive_path = require_str(member.get("archivePath"), "archivePath")
-    output_path = require_str(member.get("outputPath"), "outputPath")
-    required = bool(member.get("required", True))
+def copy_zip_member(archive: Path, member: ZipMember, package_root: Path) -> bool:
     with zipfile.ZipFile(archive) as zf:
         try:
-            matched_member = zip_member(zf, archive_path)
+            matched_member = zip_member(zf, member.archive_path)
         except RuntimeError:
-            if required:
+            if member.required:
                 raise
             return False
-        destination = package_root / output_path
+        destination = package_root / member.output_path
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(zf.read(matched_member))
         return True
@@ -138,24 +249,17 @@ def find_extracted_path(root: Path, suffix: str) -> Path:
     raise RuntimeError(f"Missing expected extracted file: {suffix}")
 
 
-def copy_extracted_member(extract_root: Path, member: dict, package_root: Path) -> bool:
-    archive_suffix = require_str(member.get("archiveSuffix"), "archiveSuffix")
-    output_path = require_str(member.get("outputPath"), "outputPath")
-    required = bool(member.get("required", True))
+def copy_extracted_member(extract_root: Path, member: TarMember, package_root: Path) -> bool:
     try:
-        source = find_extracted_path(extract_root, archive_suffix)
+        source = find_extracted_path(extract_root, member.archive_suffix)
     except RuntimeError:
-        if required:
+        if member.required:
             raise
         return False
-    destination = package_root / output_path
+    destination = package_root / member.output_path
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, destination, follow_symlinks=True)
     return True
-
-
-def register_source(source_urls: dict[str, str], output_path: str, source_url: str) -> None:
-    source_urls[output_path] = source_url
 
 
 def write_asset_manifest(
@@ -169,15 +273,15 @@ def write_asset_manifest(
         if not path.is_file() or path.name == "manifest.json":
             continue
         relative_path = path.relative_to(package_root).as_posix()
-        source_url = source_urls.get(relative_path)
-        if not source_url:
+        source_url_value = source_urls.get(relative_path)
+        if not source_url_value:
             raise RuntimeError(f"No sourceUrl mapping for {relative_path}")
         entries.append(
             {
                 "path": relative_path,
                 "size": path.stat().st_size,
                 "sha256": sha256_file(path),
-                "sourceUrl": source_url,
+                "sourceUrl": source_url_value,
             }
         )
 
@@ -217,84 +321,55 @@ def build_common_assets(sources: dict, common: Path, upstream: Path) -> dict[str
     models_dir = common / "models"
     models_dir.mkdir(parents=True, exist_ok=True)
 
-    docaligner = require_mapping(sources.get("docaligner"), "sources.docaligner")
-    docaligner_model = require_mapping(docaligner.get("model"), "docaligner.model")
-    docaligner_model_path = require_str(docaligner_model.get("outputPath"), "outputPath")
-    docaligner_model_url = require_str(docaligner_model.get("downloadUrl"), "downloadUrl")
-    subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "gdown",
-            "--id",
-            require_str(docaligner_model.get("fileId"), "fileId"),
-            "-O",
-            str(common / docaligner_model_path),
-        ],
-        check=True,
-    )
+    docaligner_model_url = get_source_url(sources, "docaligner", "model")
+    download_google_drive_or_url(docaligner_model_url, common / docaligner_model_path)
     register_source(common_source_urls, docaligner_model_path, docaligner_model_url)
 
-    docaligner_license = require_mapping(docaligner.get("license"), "docaligner.license")
-    download_source_file(docaligner_license, common, common_source_urls)
-
-    uvdoc = require_mapping(sources.get("uvdoc"), "sources.uvdoc")
-    uvdoc_license = require_mapping(uvdoc.get("license"), "uvdoc.license")
-    download_source_file(uvdoc_license, common, common_source_urls)
-
-    checkpoint = require_mapping(uvdoc.get("checkpoint"), "uvdoc.checkpoint")
-    model_source = require_mapping(uvdoc.get("modelSource"), "uvdoc.modelSource")
-    checkpoint_url = require_str(checkpoint.get("downloadUrl"), "downloadUrl")
-    checkpoint_path = upstream / require_str(checkpoint.get("cacheFile"), "cacheFile")
-    model_source_path = upstream / require_str(model_source.get("cacheFile"), "cacheFile")
-    download(checkpoint_url, checkpoint_path)
-    download(
-        require_str(model_source.get("downloadUrl"), "downloadUrl"),
-        model_source_path,
+    download_to_package(
+        get_source_url(sources, "docaligner", "license"),
+        common,
+        docaligner_license_path,
+        common_source_urls,
+    )
+    download_to_package(
+        get_source_url(sources, "uvdoc", "license"),
+        common,
+        uvdoc_license_path,
+        common_source_urls,
+    )
+    download_to_package(
+        get_source_url(sources, "uvdoc", "readme"),
+        common,
+        models_readme_path,
+        common_source_urls,
     )
 
-    sys.path.insert(0, str(upstream))
-    import torch
-    from model import UVDocnet
+    uvdoc_model_url = get_source_url(sources, "uvdoc", "model")
+    uvdoc_weights_path = download_package(uvdoc_model_url, upstream, "uvdoc-best_model.pkl")
 
-    loaded_checkpoint = torch.load(
-        checkpoint_path,
+    import torch
+    from uvdoc_model import UVDocnet
+
+    loaded_weights = torch.load(
+        uvdoc_weights_path,
         map_location="cpu",
         weights_only=False,
     )
     model = UVDocnet(num_filter=32, kernel_size=5)
-    model.load_state_dict(loaded_checkpoint["model_state"])
+    model.load_state_dict(loaded_weights["model_state"])
     model.eval()
     dummy = torch.zeros(1, 3, 488, 712, dtype=torch.float32)
-    uvdoc_output_path = require_str(checkpoint.get("outputPath"), "outputPath")
     torch.onnx.export(
         model,
         dummy,
-        common / uvdoc_output_path,
+        common / uvdoc_model_path,
         input_names=["image"],
         output_names=["grid2d", "grid3d"],
         opset_version=16,
     )
-    register_source(common_source_urls, uvdoc_output_path, checkpoint_url)
-
-    models_readme = require_mapping(sources.get("modelsReadme"), "sources.modelsReadme")
-    readme_path = require_str(models_readme.get("outputPath"), "modelsReadme.outputPath")
-    readme_lines = require_list(models_readme.get("lines"), "modelsReadme.lines")
-    write_text(common / readme_path, "\n".join(str(line) for line in readme_lines) + "\n")
-    register_source(
-        common_source_urls,
-        readme_path,
-        require_str(models_readme.get("sourceUrl"), "modelsReadme.sourceUrl"),
-    )
+    register_source(common_source_urls, uvdoc_model_path, uvdoc_model_url)
 
     return common_source_urls
-
-
-def download_source_file(config: dict, root: Path, source_urls: dict[str, str]) -> None:
-    output_path = require_str(config.get("outputPath"), "outputPath")
-    source_url = require_str(config.get("downloadUrl"), "downloadUrl")
-    download(source_url, root / output_path)
-    register_source(source_urls, output_path, source_url)
 
 
 def build_windows_assets(
@@ -304,40 +379,31 @@ def build_windows_assets(
     upstream: Path,
     common_source_urls: dict[str, str],
 ) -> tuple[Path, dict[str, str]]:
-    windows = require_mapping(sources.get("windows"), "sources.windows")
-    package_root = work / "windows-directml"
+    package_root = work / windows_platform
     copy_tree(common, package_root)
     source_urls = dict(common_source_urls)
 
-    for package_key in ["onnxRuntimeDirectML", "directML"]:
-        package = require_mapping(windows.get(package_key), f"windows.{package_key}")
-        package_url = require_str(package.get("packageUrl"), f"{package_key}.packageUrl")
-        package_path = upstream / require_str(package.get("cacheFile"), f"{package_key}.cacheFile")
-        download(package_url, package_path)
-        for member in require_list(package.get("members"), f"{package_key}.members"):
-            member_config = require_mapping(member, f"{package_key}.members[]")
-            copied = copy_zip_member(package_path, member_config, package_root)
-            if copied:
-                register_source(
-                    source_urls,
-                    require_str(member_config.get("outputPath"), "outputPath"),
-                    package_url,
-                )
+    onnxruntime_url = get_source_url(sources, "onnxruntime", "windows")
+    onnxruntime_package = download_package(
+        onnxruntime_url,
+        upstream,
+        "microsoft.ml.onnxruntime.directml.nupkg",
+    )
+    for member in windows_onnxruntime_members:
+        if copy_zip_member(onnxruntime_package, member, package_root):
+            register_source(source_urls, member.output_path, onnxruntime_url)
+
+    directml_url = get_source_url(sources, "directml")
+    directml_package = download_package(directml_url, upstream, "microsoft.ai.directml.nupkg")
+    for member in windows_directml_members:
+        if copy_zip_member(directml_package, member, package_root):
+            register_source(source_urls, member.output_path, directml_url)
 
     windows_readme = package_root / "onnxruntime" / "windows" / "README.md"
     if not windows_readme.exists():
-        onnx_package = require_mapping(
-            windows.get("onnxRuntimeDirectML"),
-            "windows.onnxRuntimeDirectML",
-        )
-        fallback_lines = require_list(onnx_package.get("fallbackReadme"), "fallbackReadme")
         output_path = "onnxruntime/windows/README.md"
-        write_text(windows_readme, " ".join(str(line) for line in fallback_lines) + "\n")
-        register_source(
-            source_urls,
-            output_path,
-            require_str(onnx_package.get("packageUrl"), "packageUrl"),
-        )
+        write_text(windows_readme, windows_ort_readme_fallback)
+        register_source(source_urls, output_path, onnxruntime_url)
 
     return package_root, source_urls
 
@@ -349,49 +415,31 @@ def build_linux_assets(
     upstream: Path,
     common_source_urls: dict[str, str],
 ) -> tuple[Path, dict[str, str]]:
-    linux = require_mapping(sources.get("linux"), "sources.linux")
-    linux_ort = require_mapping(linux.get("onnxRuntimeGpu"), "linux.onnxRuntimeGpu")
-    archive_url = require_str(linux_ort.get("archiveUrl"), "archiveUrl")
-    archive_path = upstream / require_str(linux_ort.get("cacheFile"), "cacheFile")
-    download(archive_url, archive_path)
-
-    expected_sha256 = require_str(linux_ort.get("sha256"), "sha256").lower()
-    actual_sha256 = sha256_file(archive_path)
-    if actual_sha256 != expected_sha256:
-        raise RuntimeError(
-            "Linux ONNX Runtime archive sha256 mismatch: "
-            f"{actual_sha256} != {expected_sha256}"
-        )
+    onnxruntime_url = get_source_url(sources, "onnxruntime", "linux")
+    archive_path = download_package(onnxruntime_url, upstream, "onnxruntime-linux-x64-gpu.tgz")
 
     extract_root = upstream / "linux-ort"
     safe_extract_tar(archive_path, extract_root)
 
-    package_root = work / "linux-tensorrt-cuda"
+    package_root = work / linux_platform
     copy_tree(common, package_root)
     source_urls = dict(common_source_urls)
-    for member in require_list(linux_ort.get("members"), "linux.onnxRuntimeGpu.members"):
-        member_config = require_mapping(member, "linux.onnxRuntimeGpu.members[]")
-        copied = copy_extracted_member(extract_root, member_config, package_root)
-        if copied:
-            register_source(
-                source_urls,
-                require_str(member_config.get("outputPath"), "outputPath"),
-                archive_url,
-            )
+    for member in linux_onnxruntime_members:
+        if copy_extracted_member(extract_root, member, package_root):
+            register_source(source_urls, member.output_path, onnxruntime_url)
 
     linux_readme = package_root / "onnxruntime" / "linux" / "README.md"
     if not linux_readme.exists():
-        fallback_lines = require_list(linux_ort.get("fallbackReadme"), "fallbackReadme")
         output_path = "onnxruntime/linux/README.md"
-        write_text(linux_readme, " ".join(str(line) for line in fallback_lines) + "\n")
-        register_source(source_urls, output_path, archive_url)
+        write_text(linux_readme, linux_ort_readme_fallback)
+        register_source(source_urls, output_path, onnxruntime_url)
 
     return package_root, source_urls
 
 
 def verify_archive_roots(dist: Path, asset_tag: str) -> None:
-    windows_archive = dist / f"windows-directml-{asset_tag}.zip"
-    linux_archive = dist / f"linux-tensorrt-cuda-{asset_tag}.tar.gz"
+    windows_archive = dist / f"{windows_platform}-{asset_tag}.zip"
+    linux_archive = dist / f"{linux_platform}-{asset_tag}.tar.gz"
     with zipfile.ZipFile(windows_archive) as zf:
         if "manifest.json" not in zf.namelist():
             raise RuntimeError("Windows package is missing root manifest.json.")
@@ -405,8 +453,6 @@ def main() -> None:
     source_manifest = load_json(args.source_manifest)
     if source_manifest.get("schemaVersion") != 1:
         raise RuntimeError("Unsupported asset source manifest schemaVersion.")
-
-    install_python_packages(source_manifest)
 
     sources = require_mapping(source_manifest.get("sources"), "sources")
     root = Path.cwd()
@@ -437,18 +483,18 @@ def main() -> None:
 
     write_asset_manifest(
         windows_root,
-        "windows-directml",
+        windows_platform,
         args.asset_tag,
         windows_source_urls,
     )
     write_asset_manifest(
         linux_root,
-        "linux-tensorrt-cuda",
+        linux_platform,
         args.asset_tag,
         linux_source_urls,
     )
-    package_zip(windows_root, dist / f"windows-directml-{args.asset_tag}.zip")
-    package_tar_gz(linux_root, dist / f"linux-tensorrt-cuda-{args.asset_tag}.tar.gz")
+    package_zip(windows_root, dist / f"{windows_platform}-{args.asset_tag}.zip")
+    package_tar_gz(linux_root, dist / f"{linux_platform}-{args.asset_tag}.tar.gz")
     verify_archive_roots(dist, args.asset_tag)
 
     print("Built scanner asset packages:")

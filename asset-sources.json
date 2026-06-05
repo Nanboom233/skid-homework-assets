@@ -1,171 +1,19 @@
 {
   "schemaVersion": 1,
-  "python": {
-    "packages": [
-      "gdown",
-      "onnx",
-      {
-        "name": "torch",
-        "indexUrl": "https://download.pytorch.org/whl/cpu"
-      }
-    ]
-  },
   "sources": {
     "docaligner": {
-      "model": {
-        "fileId": "14vUH77v6yGg7zFctUgcT6BzV5Iisg4Dl",
-        "downloadUrl": "https://drive.google.com/uc?id=14vUH77v6yGg7zFctUgcT6BzV5Iisg4Dl",
-        "outputPath": "models/docaligner-fastvit_sa24.onnx"
-      },
-      "license": {
-        "downloadUrl": "https://raw.githubusercontent.com/DocsaidLab/DocAligner/main/LICENSE",
-        "outputPath": "models/LICENSE-docaligner"
-      }
+      "model": "https://drive.google.com/uc?id=14vUH77v6yGg7zFctUgcT6BzV5Iisg4Dl",
+      "license": "https://raw.githubusercontent.com/DocsaidLab/DocAligner/main/LICENSE"
     },
     "uvdoc": {
-      "checkpoint": {
-        "downloadUrl": "https://github.com/tanguymagne/UVDoc/raw/main/model/best_model.pkl",
-        "cacheFile": "uvdoc-best_model.pkl",
-        "outputPath": "models/uvdoc-best-model.onnx"
-      },
-      "modelSource": {
-        "downloadUrl": "https://raw.githubusercontent.com/tanguymagne/UVDoc/main/model.py",
-        "cacheFile": "model.py"
-      },
-      "license": {
-        "downloadUrl": "https://raw.githubusercontent.com/tanguymagne/UVDoc/main/LICENSE",
-        "outputPath": "models/LICENSE-uvdoc"
-      }
+      "model": "https://github.com/tanguymagne/UVDoc/raw/main/model/best_model.pkl",
+      "license": "https://raw.githubusercontent.com/tanguymagne/UVDoc/main/LICENSE",
+      "readme": "https://raw.githubusercontent.com/tanguymagne/UVDoc/main/README.md"
     },
-    "modelsReadme": {
-      "outputPath": "models/README.md",
-      "sourceUrl": "https://raw.githubusercontent.com/tanguymagne/UVDoc/main/README.md",
-      "lines": [
-        "# Scanner model assets",
-        "",
-        "docaligner-fastvit_sa24.onnx is copied from the official",
-        "DocAligner fastvit_sa24 Google Drive model source.",
-        "",
-        "uvdoc-best-model.onnx is exported by this workflow from the",
-        "official UVDoc model/best_model.pkl checkpoint and model.py.",
-        ""
-      ]
+    "onnxruntime": {
+      "windows": "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime.directml/1.24.4/microsoft.ml.onnxruntime.directml.1.24.4.nupkg",
+      "linux": "https://github.com/microsoft/onnxruntime/releases/download/v1.24.4/onnxruntime-linux-x64-gpu-1.24.4.tgz"
     },
-    "windows": {
-      "onnxRuntimeDirectML": {
-        "packageUrl": "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime.directml/1.24.4/microsoft.ml.onnxruntime.directml.1.24.4.nupkg",
-        "cacheFile": "microsoft.ml.onnxruntime.directml.1.24.4.nupkg",
-        "members": [
-          {
-            "archivePath": "runtimes/win-x64/native/onnxruntime.dll",
-            "outputPath": "onnxruntime/windows/onnxruntime.dll",
-            "required": true
-          },
-          {
-            "archivePath": "runtimes/win-x64/native/onnxruntime_providers_shared.dll",
-            "outputPath": "onnxruntime/windows/onnxruntime_providers_shared.dll",
-            "required": true
-          },
-          {
-            "archivePath": "README.md",
-            "outputPath": "onnxruntime/windows/README.md",
-            "required": false
-          },
-          {
-            "archivePath": "LICENSE",
-            "outputPath": "onnxruntime/windows/LICENSE-onnxruntime",
-            "required": false
-          },
-          {
-            "archivePath": "ThirdPartyNotices.txt",
-            "outputPath": "onnxruntime/windows/ThirdPartyNotices-onnxruntime.txt",
-            "required": false
-          }
-        ],
-        "fallbackReadme": [
-          "Windows ONNX Runtime DirectML files are extracted from",
-          "Microsoft.ML.OnnxRuntime.DirectML and Microsoft.AI.DirectML NuGet packages."
-        ]
-      },
-      "directML": {
-        "packageUrl": "https://api.nuget.org/v3-flatcontainer/microsoft.ai.directml/1.15.4/microsoft.ai.directml.1.15.4.nupkg",
-        "cacheFile": "microsoft.ai.directml.1.15.4.nupkg",
-        "members": [
-          {
-            "archivePath": "bin/x64-win/DirectML.dll",
-            "outputPath": "onnxruntime/windows/DirectML.dll",
-            "required": true
-          },
-          {
-            "archivePath": "LICENSE",
-            "outputPath": "onnxruntime/windows/LICENSE-directml",
-            "required": false
-          }
-        ]
-      }
-    },
-    "linux": {
-      "onnxRuntimeGpu": {
-        "archiveUrl": "https://github.com/microsoft/onnxruntime/releases/download/v1.24.4/onnxruntime-linux-x64-gpu-1.24.4.tgz",
-        "sha256": "c5f804ff5d239b436fa59e9f2fb288a39f7eb9552f6a636c8b71e792e91a8808",
-        "cacheFile": "onnxruntime-linux-x64-gpu-1.24.4.tgz",
-        "members": [
-          {
-            "archiveSuffix": "lib/libonnxruntime.so",
-            "outputPath": "onnxruntime/linux/libonnxruntime.so",
-            "required": true
-          },
-          {
-            "archiveSuffix": "lib/libonnxruntime.so.1",
-            "outputPath": "onnxruntime/linux/libonnxruntime.so.1",
-            "required": true
-          },
-          {
-            "archiveSuffix": "lib/libonnxruntime.so.1.24.4",
-            "outputPath": "onnxruntime/linux/libonnxruntime.so.1.24.4",
-            "required": true
-          },
-          {
-            "archiveSuffix": "lib/libonnxruntime_providers_shared.so",
-            "outputPath": "onnxruntime/linux/libonnxruntime_providers_shared.so",
-            "required": true
-          },
-          {
-            "archiveSuffix": "lib/libonnxruntime_providers_cuda.so",
-            "outputPath": "onnxruntime/linux/libonnxruntime_providers_cuda.so",
-            "required": true
-          },
-          {
-            "archiveSuffix": "lib/libonnxruntime_providers_tensorrt.so",
-            "outputPath": "onnxruntime/linux/libonnxruntime_providers_tensorrt.so",
-            "required": true
-          },
-          {
-            "archiveSuffix": "LICENSE",
-            "outputPath": "onnxruntime/linux/LICENSE-onnxruntime",
-            "required": false
-          },
-          {
-            "archiveSuffix": "ThirdPartyNotices.txt",
-            "outputPath": "onnxruntime/linux/ThirdPartyNotices-onnxruntime.txt",
-            "required": false
-          },
-          {
-            "archiveSuffix": "Privacy.md",
-            "outputPath": "onnxruntime/linux/Privacy.md",
-            "required": false
-          },
-          {
-            "archiveSuffix": "README.md",
-            "outputPath": "onnxruntime/linux/README.md",
-            "required": false
-          }
-        ],
-        "fallbackReadme": [
-          "Linux ONNX Runtime GPU files are extracted from the official",
-          "Microsoft ONNX Runtime v1.24.4 GitHub Release asset."
-        ]
-      }
-    }
+    "directml": "https://api.nuget.org/v3-flatcontainer/microsoft.ai.directml/1.15.4/microsoft.ai.directml.1.15.4.nupkg"
   }
 }
