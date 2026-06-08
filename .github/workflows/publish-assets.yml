@@ -12,6 +12,10 @@ on:
         required: true
         type: boolean
         default: false
+      camera_source_ref:
+        description: "skid-homework ref used to build camera-server.jar"
+        required: true
+        default: "main"
 
 permissions:
   contents: write
@@ -29,9 +33,30 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6.0.3
 
+      - name: Checkout app repository
+        uses: actions/checkout@v6.0.3
+        with:
+          repository: Nanboom233/skid-homework
+          ref: ${{ inputs.camera_source_ref }}
+          path: app-source
+
       - name: Install Python dependencies
         shell: bash
         run: python -m pip install --upgrade pip -r requirements.txt
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
 
       - name: Build packages
         shell: bash
@@ -43,6 +68,16 @@ jobs:
             --work-dir work \
             --dist-dir dist
 
+      - name: Build camera server
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle -p app-source/server assembleRelease
+          cp app-source/server/build/outputs/apk/release/camera-server.jar \
+            "dist/camera-server-${ASSET_TAG}.jar"
+          sha256sum "dist/camera-server-${ASSET_TAG}.jar" \
+            > "dist/camera-server-${ASSET_TAG}.jar.sha256"
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3.0.0
         with:
@@ -52,4 +87,8 @@ jobs:
           overwrite_files: true
           files: |
             dist/windows-directml-${{ inputs.asset_tag }}.zip
+            dist/windows-directml-${{ inputs.asset_tag }}.zip.sha256
             dist/linux-tensorrt-cuda-${{ inputs.asset_tag }}.tar.gz
+            dist/linux-tensorrt-cuda-${{ inputs.asset_tag }}.tar.gz.sha256
+            dist/camera-server-${{ inputs.asset_tag }}.jar
+            dist/camera-server-${{ inputs.asset_tag }}.jar.sha256

@@ -158,6 +158,10 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def write_sha256_sidecar(path: Path) -> None:
+    write_text(path.with_name(f"{path.name}.sha256"), f"{sha256_file(path)}  {path.name}\n")
+
+
 def register_source(source_urls: dict[str, str], output_path: str, source_url_value: str) -> None:
     source_urls[output_path] = source_url_value
 
@@ -274,7 +278,6 @@ def write_asset_manifest(
             {
                 "path": relative_path,
                 "size": path.stat().st_size,
-                "sha256": sha256_file(path),
                 "sourceUrl": source_url_value,
             }
         )
@@ -488,8 +491,12 @@ def main() -> None:
         args.asset_tag,
         linux_source_urls,
     )
-    package_zip(windows_root, dist / f"{windows_platform}-{args.asset_tag}.zip")
-    package_tar_gz(linux_root, dist / f"{linux_platform}-{args.asset_tag}.tar.gz")
+    windows_archive = dist / f"{windows_platform}-{args.asset_tag}.zip"
+    linux_archive = dist / f"{linux_platform}-{args.asset_tag}.tar.gz"
+    package_zip(windows_root, windows_archive)
+    package_tar_gz(linux_root, linux_archive)
+    write_sha256_sidecar(windows_archive)
+    write_sha256_sidecar(linux_archive)
     verify_archive_roots(dist, args.asset_tag)
 
     print("Built scanner asset packages:")
