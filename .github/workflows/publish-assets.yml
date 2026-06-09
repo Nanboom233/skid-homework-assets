@@ -160,7 +160,7 @@ jobs:
             echo "previous_tag=$latest_tag"
             echo "new_tag=$new_tag"
             echo "version_name=$version_name"
-            echo "release_title=Scanner assets ${new_tag}"
+            echo "release_title=${new_tag}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Create and push tag
@@ -205,6 +205,8 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4.0.1
+        with:
+          packages: "platform-tools platforms;android-34 build-tools;34.0.0"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6.1.0
@@ -429,6 +431,8 @@ jobs:
       - name: Set up Android SDK
         if: steps.collect_operations.outputs.has_operations == 'true'
         uses: android-actions/setup-android@v4.0.1
+        with:
+          packages: "platform-tools platforms;android-34 build-tools;34.0.0"
 
       - name: Set up Gradle
         if: steps.collect_operations.outputs.has_operations == 'true'
@@ -612,7 +616,7 @@ jobs:
               fi
 
               gh release create "$new_tag" "${files[@]}" \
-                --title "Scanner assets ${new_tag}" \
+                --title "$new_tag" \
                 --notes-file release-notes.md \
                 "${prerelease_args[@]}"
             ); then
