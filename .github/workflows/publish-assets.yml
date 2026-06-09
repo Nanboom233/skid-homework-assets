@@ -3,12 +3,17 @@ name: Publish scanner assets
 on:
   workflow_dispatch:
     inputs:
-      asset_tag:
-        description: "Release tag to publish, for example v0.1.0"
+      release_type:
+        description: Select how to bump the semantic version
         required: true
-        default: "v0.1.0"
+        default: patch
+        type: choice
+        options:
+          - major
+          - minor
+          - patch
       prerelease:
-        description: "Mark the GitHub Release as a prerelease"
+        description: Mark the GitHub Release as a prerelease
         required: true
         type: boolean
         default: false
@@ -16,28 +21,177 @@ on:
         description: "skid-homework ref used to build camera-server.jar"
         required: true
         default: "main"
+  push:
+    branches:
+      - main
 
 permissions:
   contents: write
 
-run-name: Publish scanner assets ${{ inputs.asset_tag }}
+run-name: Publish scanner assets
+
+env:
+  WORKFLOW_GIT_TOKEN: ${{ secrets.WORKFLOW_GIT_TOKEN }}
+  DEFAULT_GITHUB_TOKEN: ${{ github.token }}
+  DEFAULT_CAMERA_SOURCE_REF: main
+
+concurrency:
+  group: scanner-assets-release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  publish:
-    name: Build and publish platform packages
+  manual-release:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    env:
-      ASSET_TAG: ${{ inputs.asset_tag }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6.0.3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare git auth
+        id: git_auth
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -n "${WORKFLOW_GIT_TOKEN:-}" ]; then
+            auth_token="$WORKFLOW_GIT_TOKEN"
+            token_source="WORKFLOW_GIT_TOKEN"
+          else
+            auth_token="$DEFAULT_GITHUB_TOKEN"
+            token_source="GITHUB_TOKEN"
+          fi
+
+          echo "::add-mask::$auth_token"
+          git remote set-url origin "https://x-access-token:${auth_token}@github.com/${GITHUB_REPOSITORY}.git"
+
+          {
+            echo "GH_TOKEN=$auth_token"
+            echo "TOKEN_SOURCE=$token_source"
+          } >> "$GITHUB_ENV"
+
+          echo "token_source=$token_source" >> "$GITHUB_OUTPUT"
+          echo "Token source: $token_source"
+
+      - name: Verify tag push token for workflow changes
+        if: steps.git_auth.outputs.token_source == 'GITHUB_TOKEN'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" | grep -q '^.github/workflows/'; then
+            echo "::error title=Missing WORKFLOW_GIT_TOKEN::Current commit updates .github/workflows/. GitHub's default GITHUB_TOKEN cannot push tags for workflow changes. Add repository secret WORKFLOW_GIT_TOKEN (classic PAT: repo + workflow; fine-grained PAT: Contents read/write + Workflows read/write)."
+            exit 1
+          fi
+
+      - name: Resolve release configuration
+        id: release_config
+        shell: bash
+        env:
+          INPUT_RELEASE_TYPE: ${{ inputs.release_type }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+          INPUT_CAMERA_SOURCE_REF: ${{ inputs.camera_source_ref }}
+        run: |
+          set -euo pipefail
+
+          case "${INPUT_RELEASE_TYPE}" in
+            major|minor|patch)
+              ;;
+            *)
+              echo "Unsupported release type: ${INPUT_RELEASE_TYPE}" >&2
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "release_type=${INPUT_RELEASE_TYPE}"
+            echo "prerelease=${INPUT_PRERELEASE:-false}"
+            echo "camera_source_ref=${INPUT_CAMERA_SOURCE_REF:-main}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Calculate next version
+        id: version
+        shell: bash
+        env:
+          RELEASE_TYPE: ${{ steps.release_config.outputs.release_type }}
+        run: |
+          set -euo pipefail
+
+          git fetch --tags --force
+
+          latest_tag="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | head -n 1)"
+          if [ -z "$latest_tag" ]; then
+            new_tag="v0.1.0"
+            version_name="0.1.0"
+          else
+            base_version="${latest_tag#v}"
+            IFS='.' read -r major minor patch <<< "$base_version"
+            case "$RELEASE_TYPE" in
+              major)
+                major=$((major + 1))
+                minor=0
+                patch=0
+                ;;
+              minor)
+                minor=$((minor + 1))
+                patch=0
+                ;;
+              patch)
+                patch=$((patch + 1))
+                ;;
+              *)
+                echo "Unsupported release type: $RELEASE_TYPE" >&2
+                exit 1
+                ;;
+            esac
+
+            version_name="${major}.${minor}.${patch}"
+            new_tag="v${version_name}"
+          fi
+
+          if git rev-parse "refs/tags/$new_tag" >/dev/null 2>&1 || git ls-remote --exit-code --tags origin "refs/tags/$new_tag" >/dev/null 2>&1; then
+            echo "Tag $new_tag already exists." >&2
+            exit 1
+          fi
+
+          {
+            echo "previous_tag=$latest_tag"
+            echo "new_tag=$new_tag"
+            echo "version_name=$version_name"
+            echo "release_title=Scanner assets ${new_tag}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create and push tag
+        id: push_tag
+        shell: bash
+        env:
+          NEW_TAG: ${{ steps.version.outputs.new_tag }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "$NEW_TAG" "$GITHUB_SHA"
+
+          push_log="$RUNNER_TEMP/git-push-${NEW_TAG}.log"
+          if git push origin "$NEW_TAG" 2>&1 | tee "$push_log"; then
+            exit 0
+          fi
+
+          git tag -d "$NEW_TAG" >/dev/null 2>&1 || true
+          if grep -Fq 'without `workflows` permission' "$push_log"; then
+            echo "::error title=Missing WORKFLOW_GIT_TOKEN::Failed to push tag $NEW_TAG because the current token does not have workflows permission. Configure repository secret WORKFLOW_GIT_TOKEN (classic PAT: repo + workflow; fine-grained PAT: Contents read/write + Workflows read/write)."
+          fi
+          exit 1
 
       - name: Checkout app repository
         uses: actions/checkout@v6.0.3
         with:
           repository: Nanboom233/skid-homework
-          ref: ${{ inputs.camera_source_ref }}
+          ref: ${{ steps.release_config.outputs.camera_source_ref }}
           path: app-source
 
       - name: Install Python dependencies
@@ -45,21 +199,23 @@ jobs:
         run: python -m pip install --upgrade pip -r requirements.txt
 
       - name: Set up Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5.2.0
         with:
           distribution: temurin
           java-version: "17"
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4.0.1
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6.1.0
         with:
           gradle-version: "8.7"
 
       - name: Build packages
         shell: bash
+        env:
+          ASSET_TAG: ${{ steps.version.outputs.new_tag }}
         run: |
           set -euo pipefail
           python .github/scripts/build_assets.py \
@@ -70,25 +226,381 @@ jobs:
 
       - name: Build camera server
         shell: bash
+        env:
+          ASSET_TAG: ${{ steps.version.outputs.new_tag }}
         run: |
           set -euo pipefail
-          gradle -p app-source/server -PassetVersion="${ASSET_TAG}" assembleRelease
+          gradle -p app-source/server -PassetVersion="${ASSET_TAG}" clean assembleRelease
           cp app-source/server/build/outputs/apk/release/camera-server.jar \
             "dist/camera-server-${ASSET_TAG}.jar"
           sha256sum "dist/camera-server-${ASSET_TAG}.jar" \
             > "dist/camera-server-${ASSET_TAG}.jar.sha256"
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v3.0.0
+        shell: bash
+        env:
+          NEW_TAG: ${{ steps.version.outputs.new_tag }}
+          RELEASE_TITLE: ${{ steps.version.outputs.release_title }}
+          RELEASE_PRERELEASE: ${{ steps.release_config.outputs.prerelease }}
+          CAMERA_SOURCE_REF: ${{ steps.release_config.outputs.camera_source_ref }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          files=(
+            "dist/windows-directml-${NEW_TAG}.zip"
+            "dist/windows-directml-${NEW_TAG}.zip.sha256"
+            "dist/linux-tensorrt-cuda-${NEW_TAG}.tar.gz"
+            "dist/linux-tensorrt-cuda-${NEW_TAG}.tar.gz.sha256"
+            "dist/camera-server-${NEW_TAG}.jar"
+            "dist/camera-server-${NEW_TAG}.jar.sha256"
+          )
+          for file in "${files[@]}"; do
+            if [ ! -f "$file" ]; then
+              echo "Expected release artifact was not produced: $file" >&2
+              exit 1
+            fi
+          done
+
+          cat > release-notes.md <<EOF
+          Scanner assets ${NEW_TAG}
+
+          Assets source: ${GITHUB_REPOSITORY}@${GITHUB_SHA}
+          Camera server source: Nanboom233/skid-homework@${CAMERA_SOURCE_REF}
+          EOF
+
+          prerelease_args=()
+          if [ "$RELEASE_PRERELEASE" = "true" ]; then
+            prerelease_args+=(--prerelease)
+          fi
+
+          gh release create "$NEW_TAG" "${files[@]}" \
+            --title "$RELEASE_TITLE" \
+            --notes-file release-notes.md \
+            "${prerelease_args[@]}"
+
+      - name: Roll back tag on failure
+        if: ${{ failure() && steps.push_tag.outcome == 'success' }}
+        shell: bash
+        env:
+          NEW_TAG: ${{ steps.version.outputs.new_tag }}
+        run: |
+          set +e
+
+          gh release delete "$NEW_TAG" --yes --cleanup-tag
+          if [ $? -ne 0 ]; then
+            git push --delete origin "$NEW_TAG" || true
+          fi
+
+          git tag -d "$NEW_TAG" >/dev/null 2>&1 || true
+
+          if git ls-remote --exit-code --tags origin "refs/tags/$NEW_TAG" >/dev/null 2>&1; then
+            echo "Failed to roll back remote tag $NEW_TAG" >&2
+            exit 1
+          fi
+
+  process-push-releases:
+    if: github.event_name == 'push' && github.event.deleted == false
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6.0.3
         with:
-          tag_name: ${{ inputs.asset_tag }}
-          name: ${{ inputs.asset_tag }}
-          prerelease: ${{ inputs.prerelease }}
-          overwrite_files: true
-          files: |
-            dist/windows-directml-${{ inputs.asset_tag }}.zip
-            dist/windows-directml-${{ inputs.asset_tag }}.zip.sha256
-            dist/linux-tensorrt-cuda-${{ inputs.asset_tag }}.tar.gz
-            dist/linux-tensorrt-cuda-${{ inputs.asset_tag }}.tar.gz.sha256
-            dist/camera-server-${{ inputs.asset_tag }}.jar
-            dist/camera-server-${{ inputs.asset_tag }}.jar.sha256
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare git auth
+        id: git_auth
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -n "${WORKFLOW_GIT_TOKEN:-}" ]; then
+            auth_token="$WORKFLOW_GIT_TOKEN"
+            token_source="WORKFLOW_GIT_TOKEN"
+          else
+            auth_token="$DEFAULT_GITHUB_TOKEN"
+            token_source="GITHUB_TOKEN"
+          fi
+
+          echo "::add-mask::$auth_token"
+          git remote set-url origin "https://x-access-token:${auth_token}@github.com/${GITHUB_REPOSITORY}.git"
+
+          {
+            echo "GH_TOKEN=$auth_token"
+            echo "TOKEN_SOURCE=$token_source"
+          } >> "$GITHUB_ENV"
+
+          echo "token_source=$token_source" >> "$GITHUB_OUTPUT"
+          echo "Token source: $token_source"
+
+      - name: Collect release operations
+        id: collect_operations
+        shell: bash
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+
+          zero_sha="0000000000000000000000000000000000000000"
+          ops_file="$RUNNER_TEMP/release-operations.tsv"
+          : > "$ops_file"
+
+          if [ -z "${AFTER_SHA:-}" ] || [ "$AFTER_SHA" = "$zero_sha" ]; then
+            commits=()
+          elif [ -z "${BEFORE_SHA:-}" ] || [ "$BEFORE_SHA" = "$zero_sha" ]; then
+            mapfile -t commits < <(git rev-list --reverse "$AFTER_SHA")
+          else
+            mapfile -t commits < <(git rev-list --reverse "${BEFORE_SHA}..${AFTER_SHA}")
+          fi
+
+          for sha in "${commits[@]:-}"; do
+            [ -n "$sha" ] || continue
+            message="$(git log -1 --pretty=%B "$sha")"
+            lower_message="$(printf '%s' "$message" | tr '[:upper:]' '[:lower:]')"
+
+            if [[ "$lower_message" =~ \[(pre-release|release)[[:space:]]+(major|minor|patch)\]$ ]]; then
+              action="${BASH_REMATCH[1]}"
+              release_type="${BASH_REMATCH[2]}"
+              subject="$(git log -1 --pretty=%s "$sha")"
+              printf '%s\t%s\t%s\t%s\n' "$sha" "$action" "$release_type" "$subject" >> "$ops_file"
+            fi
+          done
+
+          if [ -s "$ops_file" ]; then
+            echo "has_operations=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_operations=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "operations_path=$ops_file" >> "$GITHUB_OUTPUT"
+
+      - name: Show release summary
+        if: steps.collect_operations.outputs.has_operations == 'true'
+        shell: bash
+        env:
+          OPERATIONS_PATH: ${{ steps.collect_operations.outputs.operations_path }}
+        run: |
+          set -euo pipefail
+
+          index=0
+          while IFS=$'\t' read -r sha action release_type subject; do
+            [ -n "$sha" ] || continue
+            index=$((index + 1))
+            short_sha="$(git rev-parse --short "$sha")"
+            echo "$index. $short_sha | $action $release_type | $subject"
+            if git diff-tree --no-commit-id --name-only -r "$sha" | grep -q '^.github/workflows/'; then
+              echo "   touches .github/workflows/"
+            fi
+          done < "$OPERATIONS_PATH"
+
+      - name: Checkout app repository
+        if: steps.collect_operations.outputs.has_operations == 'true'
+        uses: actions/checkout@v6.0.3
+        with:
+          repository: Nanboom233/skid-homework
+          ref: ${{ env.DEFAULT_CAMERA_SOURCE_REF }}
+          path: app-source
+
+      - name: Set up Java
+        if: steps.collect_operations.outputs.has_operations == 'true'
+        uses: actions/setup-java@v5.2.0
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        if: steps.collect_operations.outputs.has_operations == 'true'
+        uses: android-actions/setup-android@v4.0.1
+
+      - name: Set up Gradle
+        if: steps.collect_operations.outputs.has_operations == 'true'
+        uses: gradle/actions/setup-gradle@v6.1.0
+        with:
+          gradle-version: "8.7"
+
+      - name: Execute release operations
+        if: steps.collect_operations.outputs.has_operations == 'true'
+        shell: bash
+        env:
+          OPERATIONS_PATH: ${{ steps.collect_operations.outputs.operations_path }}
+          TOKEN_SOURCE: ${{ steps.git_auth.outputs.token_source }}
+          APP_SOURCE_DIR: ${{ github.workspace }}/app-source
+          CAMERA_SOURCE_REF: ${{ env.DEFAULT_CAMERA_SOURCE_REF }}
+        run: |
+          set -euo pipefail
+
+          git fetch --tags --force
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          total="$(grep -cve '^$' "$OPERATIONS_PATH")"
+
+          get_latest_tag() {
+            git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | head -n 1
+          }
+
+          calculate_next_version() {
+            local latest_tag="$1"
+            local release_type="$2"
+
+            if [ -z "$latest_tag" ]; then
+              CALCULATED_TAG="v0.1.0"
+              CALCULATED_VERSION_NAME="0.1.0"
+              return
+            fi
+
+            local base_version major minor patch
+            base_version="${latest_tag#v}"
+            IFS='.' read -r major minor patch <<< "$base_version"
+            case "$release_type" in
+              major)
+                major=$((major + 1))
+                minor=0
+                patch=0
+                ;;
+              minor)
+                minor=$((minor + 1))
+                patch=0
+                ;;
+              patch)
+                patch=$((patch + 1))
+                ;;
+              *)
+                echo "Unsupported release type: $release_type" >&2
+                exit 1
+                ;;
+            esac
+
+            CALCULATED_VERSION_NAME="${major}.${minor}.${patch}"
+            CALCULATED_TAG="v${CALCULATED_VERSION_NAME}"
+          }
+
+          rollback_release_tag() {
+            local tag_name="$1"
+            set +e
+
+            gh release delete "$tag_name" --yes --cleanup-tag
+            if [ $? -ne 0 ]; then
+              git push --delete origin "$tag_name" || true
+            fi
+
+            git tag -d "$tag_name" >/dev/null 2>&1 || true
+
+            if git ls-remote --exit-code --tags origin "refs/tags/$tag_name" >/dev/null 2>&1; then
+              echo "Failed to roll back remote tag $tag_name" >&2
+              exit 1
+            fi
+
+            set -e
+          }
+
+          index=0
+          while IFS=$'\t' read -r sha action release_type subject; do
+            [ -n "$sha" ] || continue
+            index=$((index + 1))
+            short_sha="$(git rev-parse --short "$sha")"
+            previous_tag="$(get_latest_tag)"
+            calculate_next_version "$previous_tag" "$release_type"
+            new_tag="$CALCULATED_TAG"
+
+            echo "==> [$index/$total] $short_sha $action $release_type -> $new_tag"
+            echo "    $subject"
+
+            if git diff-tree --no-commit-id --name-only -r "$sha" | grep -q '^.github/workflows/'; then
+              echo "    touches .github/workflows/"
+              if [ "$TOKEN_SOURCE" = "GITHUB_TOKEN" ]; then
+                echo "::error title=Missing WORKFLOW_GIT_TOKEN::Commit $short_sha updates .github/workflows/. GitHub's default GITHUB_TOKEN cannot push tags for workflow changes. Add repository secret WORKFLOW_GIT_TOKEN (classic PAT: repo + workflow; fine-grained PAT: Contents read/write + Workflows read/write)."
+                exit 1
+              fi
+            fi
+
+            if git rev-parse "refs/tags/$new_tag" >/dev/null 2>&1 || git ls-remote --exit-code --tags origin "refs/tags/$new_tag" >/dev/null 2>&1; then
+              echo "Tag $new_tag already exists." >&2
+              exit 1
+            fi
+
+            git tag "$new_tag" "$sha"
+
+            push_log="$RUNNER_TEMP/git-push-${new_tag}.log"
+            if ! git push origin "$new_tag" 2>&1 | tee "$push_log"; then
+              git tag -d "$new_tag" >/dev/null 2>&1 || true
+              if grep -Fq 'without `workflows` permission' "$push_log"; then
+                echo "::error title=Missing WORKFLOW_GIT_TOKEN::Failed to push tag $new_tag because the current token does not have workflows permission. Configure repository secret WORKFLOW_GIT_TOKEN (classic PAT: repo + workflow; fine-grained PAT: Contents read/write + Workflows read/write)."
+              fi
+              exit 1
+            fi
+
+            worktree_dir="$RUNNER_TEMP/assets-release-${index}-${new_tag}"
+            rm -rf "$worktree_dir"
+            git worktree add --force --detach "$worktree_dir" "$sha"
+
+            if ! (
+              set -euo pipefail
+              cd "$worktree_dir"
+
+              python -m pip install --upgrade pip -r requirements.txt
+              python .github/scripts/build_assets.py \
+                --asset-tag "$new_tag" \
+                --source-manifest asset-sources.json \
+                --work-dir work \
+                --dist-dir dist
+
+              gradle -p "$APP_SOURCE_DIR/server" -PassetVersion="$new_tag" clean assembleRelease
+              cp "$APP_SOURCE_DIR/server/build/outputs/apk/release/camera-server.jar" \
+                "dist/camera-server-${new_tag}.jar"
+              sha256sum "dist/camera-server-${new_tag}.jar" \
+                > "dist/camera-server-${new_tag}.jar.sha256"
+
+              files=(
+                "dist/windows-directml-${new_tag}.zip"
+                "dist/windows-directml-${new_tag}.zip.sha256"
+                "dist/linux-tensorrt-cuda-${new_tag}.tar.gz"
+                "dist/linux-tensorrt-cuda-${new_tag}.tar.gz.sha256"
+                "dist/camera-server-${new_tag}.jar"
+                "dist/camera-server-${new_tag}.jar.sha256"
+              )
+              for file in "${files[@]}"; do
+                if [ ! -f "$file" ]; then
+                  echo "Expected release artifact was not produced: $file" >&2
+                  exit 1
+                fi
+              done
+
+              cat > release-notes.md <<EOF
+          Scanner assets ${new_tag}
+
+          Assets source: ${GITHUB_REPOSITORY}@${sha}
+          Camera server source: Nanboom233/skid-homework@${CAMERA_SOURCE_REF}
+          Trigger commit: ${subject}
+          EOF
+
+              prerelease_args=()
+              if [ "$action" = "pre-release" ]; then
+                prerelease_args+=(--prerelease)
+              fi
+
+              gh release create "$new_tag" "${files[@]}" \
+                --title "Scanner assets ${new_tag}" \
+                --notes-file release-notes.md \
+                "${prerelease_args[@]}"
+            ); then
+              set +e
+              git worktree remove --force "$worktree_dir" >/dev/null 2>&1 || true
+              git worktree prune >/dev/null 2>&1 || true
+              rm -rf "$worktree_dir"
+              rollback_release_tag "$new_tag"
+              exit 1
+            fi
+
+            git worktree remove --force "$worktree_dir" >/dev/null 2>&1 || true
+            git worktree prune >/dev/null 2>&1 || true
+            rm -rf "$worktree_dir"
+          done < "$OPERATIONS_PATH"
+
+      - name: No actionable release commits
+        if: steps.collect_operations.outputs.has_operations != 'true'
+        shell: bash
+        run: |
+          echo "No release or pre-release commits were found in this push."
