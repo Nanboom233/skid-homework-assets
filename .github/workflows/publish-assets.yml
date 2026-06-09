@@ -82,7 +82,7 @@ jobs:
         uses: softprops/action-gh-release@v3.0.0
         with:
           tag_name: ${{ inputs.asset_tag }}
-          name: Scanner assets ${{ inputs.asset_tag }}
+          name: ${{ inputs.asset_tag }}
           prerelease: ${{ inputs.prerelease }}
           overwrite_files: true
           files: |
