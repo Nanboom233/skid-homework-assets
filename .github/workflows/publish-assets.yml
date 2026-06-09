@@ -33,7 +33,6 @@ run-name: Publish scanner assets
 env:
   WORKFLOW_GIT_TOKEN: ${{ secrets.WORKFLOW_GIT_TOKEN }}
   DEFAULT_GITHUB_TOKEN: ${{ github.token }}
-  DEFAULT_CAMERA_SOURCE_REF: main
 
 concurrency:
   group: scanner-assets-release-${{ github.ref }}
@@ -339,34 +338,54 @@ jobs:
         id: collect_operations
         shell: bash
         env:
-          BEFORE_SHA: ${{ github.event.before }}
           AFTER_SHA: ${{ github.event.after }}
         run: |
           set -euo pipefail
 
           zero_sha="0000000000000000000000000000000000000000"
           ops_file="$RUNNER_TEMP/release-operations.tsv"
+          commits_file="$RUNNER_TEMP/push-commits.txt"
           : > "$ops_file"
+          : > "$commits_file"
 
-          if [ -z "${AFTER_SHA:-}" ] || [ "$AFTER_SHA" = "$zero_sha" ]; then
-            commits=()
-          elif [ -z "${BEFORE_SHA:-}" ] || [ "$BEFORE_SHA" = "$zero_sha" ]; then
-            mapfile -t commits < <(git rev-list --reverse "$AFTER_SHA")
-          else
-            mapfile -t commits < <(git rev-list --reverse "${BEFORE_SHA}..${AFTER_SHA}")
+          if [ -n "${AFTER_SHA:-}" ] && [ "$AFTER_SHA" != "$zero_sha" ]; then
+            python3 - "$GITHUB_EVENT_PATH" "$AFTER_SHA" <<'PY' > "$commits_file"
+          import json
+          import sys
+
+          event_path = sys.argv[1]
+          after_sha = sys.argv[2]
+          zero_sha = "0000000000000000000000000000000000000000"
+
+          with open(event_path, "r", encoding="utf-8") as handle:
+              event = json.load(handle)
+
+          commits = [
+              commit.get("id")
+              for commit in event.get("commits", [])
+              if commit.get("id")
+          ]
+          if not commits and after_sha and after_sha != zero_sha:
+              commits = [after_sha]
+
+          for commit_id in commits:
+              print(commit_id)
+          PY
           fi
+          mapfile -t commits < "$commits_file"
 
           for sha in "${commits[@]:-}"; do
             [ -n "$sha" ] || continue
             message="$(git log -1 --pretty=%B "$sha")"
-            lower_message="$(printf '%s' "$message" | tr '[:upper:]' '[:lower:]')"
-
-            if [[ "$lower_message" =~ \[(pre-release|release)[[:space:]]+(major|minor|patch)\]$ ]]; then
-              action="${BASH_REMATCH[1]}"
-              release_type="${BASH_REMATCH[2]}"
+            shopt -s nocasematch
+            if [[ "$message" =~ \[(pre-release|release)[[:space:]]+(major|minor|patch)([[:space:]]+from[[:space:]]+([^[:space:]]+))?\]$ ]]; then
+              action="$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')"
+              release_type="$(printf '%s' "${BASH_REMATCH[2]}" | tr '[:upper:]' '[:lower:]')"
+              camera_source_ref="${BASH_REMATCH[4]:-__default_branch__}"
               subject="$(git log -1 --pretty=%s "$sha")"
-              printf '%s\t%s\t%s\t%s\n' "$sha" "$action" "$release_type" "$subject" >> "$ops_file"
+              printf '%s\t%s\t%s\t%s\t%s\n' "$sha" "$action" "$release_type" "$camera_source_ref" "$subject" >> "$ops_file"
             fi
+            shopt -u nocasematch
           done
 
           if [ -s "$ops_file" ]; then
@@ -385,23 +404,20 @@ jobs:
           set -euo pipefail
 
           index=0
-          while IFS=$'\t' read -r sha action release_type subject; do
+          while IFS=$'\t' read -r sha action release_type camera_source_ref subject; do
             [ -n "$sha" ] || continue
             index=$((index + 1))
             short_sha="$(git rev-parse --short "$sha")"
-            echo "$index. $short_sha | $action $release_type | $subject"
+            if [ "$camera_source_ref" = "__default_branch__" ]; then
+              camera_source_label="default branch"
+            else
+              camera_source_label="$camera_source_ref"
+            fi
+            echo "$index. $short_sha | $action $release_type | app: $camera_source_label | $subject"
             if git diff-tree --no-commit-id --name-only -r "$sha" | grep -q '^.github/workflows/'; then
               echo "   touches .github/workflows/"
             fi
           done < "$OPERATIONS_PATH"
-
-      - name: Checkout app repository
-        if: steps.collect_operations.outputs.has_operations == 'true'
-        uses: actions/checkout@v6.0.3
-        with:
-          repository: Nanboom233/skid-homework
-          ref: ${{ env.DEFAULT_CAMERA_SOURCE_REF }}
-          path: app-source
 
       - name: Set up Java
         if: steps.collect_operations.outputs.has_operations == 'true'
@@ -426,8 +442,6 @@ jobs:
         env:
           OPERATIONS_PATH: ${{ steps.collect_operations.outputs.operations_path }}
           TOKEN_SOURCE: ${{ steps.git_auth.outputs.token_source }}
-          APP_SOURCE_DIR: ${{ github.workspace }}/app-source
-          CAMERA_SOURCE_REF: ${{ env.DEFAULT_CAMERA_SOURCE_REF }}
         run: |
           set -euo pipefail
 
@@ -497,15 +511,21 @@ jobs:
           }
 
           index=0
-          while IFS=$'\t' read -r sha action release_type subject; do
+          while IFS=$'\t' read -r sha action release_type camera_source_ref subject; do
             [ -n "$sha" ] || continue
             index=$((index + 1))
             short_sha="$(git rev-parse --short "$sha")"
             previous_tag="$(get_latest_tag)"
             calculate_next_version "$previous_tag" "$release_type"
             new_tag="$CALCULATED_TAG"
+            if [ "$camera_source_ref" = "__default_branch__" ]; then
+              camera_source_label="default branch"
+            else
+              camera_source_label="$camera_source_ref"
+            fi
 
             echo "==> [$index/$total] $short_sha $action $release_type -> $new_tag"
+            echo "    app source: $camera_source_label"
             echo "    $subject"
 
             if git diff-tree --no-commit-id --name-only -r "$sha" | grep -q '^.github/workflows/'; then
@@ -533,11 +553,21 @@ jobs:
             fi
 
             worktree_dir="$RUNNER_TEMP/assets-release-${index}-${new_tag}"
+            app_source_dir="$RUNNER_TEMP/app-source-${index}-${new_tag}"
             rm -rf "$worktree_dir"
-            git worktree add --force --detach "$worktree_dir" "$sha"
+            rm -rf "$app_source_dir"
 
             if ! (
               set -euo pipefail
+              git worktree add --force --detach "$worktree_dir" "$sha"
+              if [ "$camera_source_ref" = "__default_branch__" ]; then
+                gh repo clone Nanboom233/skid-homework "$app_source_dir" -- --depth 1
+              else
+                gh repo clone Nanboom233/skid-homework "$app_source_dir" -- \
+                  --depth 1 \
+                  --branch "$camera_source_ref" \
+                  --single-branch
+              fi
               cd "$worktree_dir"
 
               python -m pip install --upgrade pip -r requirements.txt
@@ -547,8 +577,8 @@ jobs:
                 --work-dir work \
                 --dist-dir dist
 
-              gradle -p "$APP_SOURCE_DIR/server" -PassetVersion="$new_tag" clean assembleRelease
-              cp "$APP_SOURCE_DIR/server/build/outputs/apk/release/camera-server.jar" \
+              gradle -p "$app_source_dir/server" -PassetVersion="$new_tag" clean assembleRelease
+              cp "$app_source_dir/server/build/outputs/apk/release/camera-server.jar" \
                 "dist/camera-server-${new_tag}.jar"
               sha256sum "dist/camera-server-${new_tag}.jar" \
                 > "dist/camera-server-${new_tag}.jar.sha256"
@@ -572,7 +602,7 @@ jobs:
           Scanner assets ${new_tag}
 
           Assets source: ${GITHUB_REPOSITORY}@${sha}
-          Camera server source: Nanboom233/skid-homework@${CAMERA_SOURCE_REF}
+          Camera server source: Nanboom233/skid-homework@${camera_source_label}
           Trigger commit: ${subject}
           EOF
 
@@ -590,6 +620,7 @@ jobs:
               git worktree remove --force "$worktree_dir" >/dev/null 2>&1 || true
               git worktree prune >/dev/null 2>&1 || true
               rm -rf "$worktree_dir"
+              rm -rf "$app_source_dir"
               rollback_release_tag "$new_tag"
               exit 1
             fi
@@ -597,6 +628,7 @@ jobs:
             git worktree remove --force "$worktree_dir" >/dev/null 2>&1 || true
             git worktree prune >/dev/null 2>&1 || true
             rm -rf "$worktree_dir"
+            rm -rf "$app_source_dir"
           done < "$OPERATIONS_PATH"
 
       - name: No actionable release commits
