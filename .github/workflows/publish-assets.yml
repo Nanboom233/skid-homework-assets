@@ -72,7 +72,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gradle -p app-source/server assembleRelease
+          gradle -p app-source/server -PassetVersion="${ASSET_TAG}" assembleRelease
           cp app-source/server/build/outputs/apk/release/camera-server.jar \
             "dist/camera-server-${ASSET_TAG}.jar"
           sha256sum "dist/camera-server-${ASSET_TAG}.jar" \
