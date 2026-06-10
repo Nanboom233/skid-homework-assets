@@ -3,6 +3,15 @@ name: Publish scanner assets
 on:
   workflow_dispatch:
     inputs:
+      release_target:
+        description: Select which scanner asset family to build
+        required: true
+        default: all
+        type: choice
+        options:
+          - ort
+          - server
+          - all
       release_type:
         description: Select how to bump the semantic version
         required: true
@@ -90,11 +99,21 @@ jobs:
         id: release_config
         shell: bash
         env:
+          INPUT_RELEASE_TARGET: ${{ inputs.release_target }}
           INPUT_RELEASE_TYPE: ${{ inputs.release_type }}
           INPUT_PRERELEASE: ${{ inputs.prerelease }}
           INPUT_CAMERA_SOURCE_REF: ${{ inputs.camera_source_ref }}
         run: |
           set -euo pipefail
+
+          case "${INPUT_RELEASE_TARGET}" in
+            ort|server|all)
+              ;;
+            *)
+              echo "Unsupported release target: ${INPUT_RELEASE_TARGET}" >&2
+              exit 1
+              ;;
+          esac
 
           case "${INPUT_RELEASE_TYPE}" in
             major|minor|patch)
@@ -106,6 +125,7 @@ jobs:
           esac
 
           {
+            echo "release_target=${INPUT_RELEASE_TARGET}"
             echo "release_type=${INPUT_RELEASE_TYPE}"
             echo "prerelease=${INPUT_PRERELEASE:-false}"
             echo "camera_source_ref=${INPUT_CAMERA_SOURCE_REF:-main}"
@@ -187,6 +207,7 @@ jobs:
           exit 1
 
       - name: Checkout app repository
+        if: steps.release_config.outputs.release_target != 'ort'
         uses: actions/checkout@v6.0.3
         with:
           repository: Nanboom233/skid-homework
@@ -194,26 +215,31 @@ jobs:
           path: app-source
 
       - name: Install Python dependencies
+        if: steps.release_config.outputs.release_target != 'server'
         shell: bash
         run: python -m pip install --upgrade pip -r requirements.txt
 
       - name: Set up Java
+        if: steps.release_config.outputs.release_target != 'ort'
         uses: actions/setup-java@v5.2.0
         with:
           distribution: temurin
           java-version: "17"
 
       - name: Set up Android SDK
+        if: steps.release_config.outputs.release_target != 'ort'
         uses: android-actions/setup-android@v4.0.1
         with:
           packages: "platform-tools platforms;android-34 build-tools;34.0.0"
 
       - name: Set up Gradle
+        if: steps.release_config.outputs.release_target != 'ort'
         uses: gradle/actions/setup-gradle@v6.1.0
         with:
           gradle-version: "8.7"
 
       - name: Build packages
+        if: steps.release_config.outputs.release_target != 'server'
         shell: bash
         env:
           ASSET_TAG: ${{ steps.version.outputs.new_tag }}
@@ -226,11 +252,13 @@ jobs:
             --dist-dir dist
 
       - name: Build camera server
+        if: steps.release_config.outputs.release_target != 'ort'
         shell: bash
         env:
           ASSET_TAG: ${{ steps.version.outputs.new_tag }}
         run: |
           set -euo pipefail
+          mkdir -p dist
           gradle -p app-source/server -PassetVersion="${ASSET_TAG}" clean assembleRelease
           cp app-source/server/build/outputs/apk/release/camera-server.jar \
             "dist/camera-server-${ASSET_TAG}.jar"
@@ -243,19 +271,27 @@ jobs:
           NEW_TAG: ${{ steps.version.outputs.new_tag }}
           RELEASE_TITLE: ${{ steps.version.outputs.release_title }}
           RELEASE_PRERELEASE: ${{ steps.release_config.outputs.prerelease }}
+          RELEASE_TARGET: ${{ steps.release_config.outputs.release_target }}
           CAMERA_SOURCE_REF: ${{ steps.release_config.outputs.camera_source_ref }}
         run: |
           set -euo pipefail
           shopt -s nullglob
 
-          files=(
-            "dist/windows-directml-${NEW_TAG}.zip"
-            "dist/windows-directml-${NEW_TAG}.zip.sha256"
-            "dist/linux-tensorrt-cuda-${NEW_TAG}.tar.gz"
-            "dist/linux-tensorrt-cuda-${NEW_TAG}.tar.gz.sha256"
-            "dist/camera-server-${NEW_TAG}.jar"
-            "dist/camera-server-${NEW_TAG}.jar.sha256"
-          )
+          files=()
+          if [ "$RELEASE_TARGET" != "server" ]; then
+            files+=(
+              "dist/windows-directml-${NEW_TAG}.zip"
+              "dist/windows-directml-${NEW_TAG}.zip.sha256"
+              "dist/linux-tensorrt-cuda-${NEW_TAG}.tar.gz"
+              "dist/linux-tensorrt-cuda-${NEW_TAG}.tar.gz.sha256"
+            )
+          fi
+          if [ "$RELEASE_TARGET" != "ort" ]; then
+            files+=(
+              "dist/camera-server-${NEW_TAG}.jar"
+              "dist/camera-server-${NEW_TAG}.jar.sha256"
+            )
+          fi
           for file in "${files[@]}"; do
             if [ ! -f "$file" ]; then
               echo "Expected release artifact was not produced: $file" >&2
@@ -266,9 +302,12 @@ jobs:
           cat > release-notes.md <<EOF
           Scanner assets ${NEW_TAG}
 
+          Release target: ${RELEASE_TARGET}
           Assets source: ${GITHUB_REPOSITORY}@${GITHUB_SHA}
-          Camera server source: Nanboom233/skid-homework@${CAMERA_SOURCE_REF}
           EOF
+          if [ "$RELEASE_TARGET" != "ort" ]; then
+            echo "Camera server source: Nanboom233/skid-homework@${CAMERA_SOURCE_REF}" >> release-notes.md
+          fi
 
           prerelease_args=()
           if [ "$RELEASE_PRERELEASE" = "true" ]; then
@@ -347,6 +386,7 @@ jobs:
           zero_sha="0000000000000000000000000000000000000000"
           ops_file="$RUNNER_TEMP/release-operations.tsv"
           commits_file="$RUNNER_TEMP/push-commits.txt"
+          has_server_operations=false
           : > "$ops_file"
           : > "$commits_file"
 
@@ -380,12 +420,16 @@ jobs:
             [ -n "$sha" ] || continue
             message="$(git log -1 --pretty=%B "$sha")"
             shopt -s nocasematch
-            if [[ "$message" =~ \[(pre-release|release)[[:space:]]+(major|minor|patch)([[:space:]]+from[[:space:]]+([^[:space:]]+))?\]$ ]]; then
+            if [[ "$message" =~ \[(pre-release|release)[[:space:]]+(ort|server|all)[[:space:]]+(major|minor|patch)([[:space:]]+from[[:space:]]+([^[:space:]]+))?\]$ ]]; then
               action="$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')"
-              release_type="$(printf '%s' "${BASH_REMATCH[2]}" | tr '[:upper:]' '[:lower:]')"
-              camera_source_ref="${BASH_REMATCH[4]:-__default_branch__}"
+              release_target="$(printf '%s' "${BASH_REMATCH[2]}" | tr '[:upper:]' '[:lower:]')"
+              release_type="$(printf '%s' "${BASH_REMATCH[3]}" | tr '[:upper:]' '[:lower:]')"
+              camera_source_ref="${BASH_REMATCH[5]:-__default_branch__}"
               subject="$(git log -1 --pretty=%s "$sha")"
-              printf '%s\t%s\t%s\t%s\t%s\n' "$sha" "$action" "$release_type" "$camera_source_ref" "$subject" >> "$ops_file"
+              printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$sha" "$action" "$release_target" "$release_type" "$camera_source_ref" "$subject" >> "$ops_file"
+              if [ "$release_target" != "ort" ]; then
+                has_server_operations=true
+              fi
             fi
             shopt -u nocasematch
           done
@@ -395,6 +439,7 @@ jobs:
           else
             echo "has_operations=false" >> "$GITHUB_OUTPUT"
           fi
+          echo "has_server_operations=$has_server_operations" >> "$GITHUB_OUTPUT"
           echo "operations_path=$ops_file" >> "$GITHUB_OUTPUT"
 
       - name: Show release summary
@@ -406,36 +451,38 @@ jobs:
           set -euo pipefail
 
           index=0
-          while IFS=$'\t' read -r sha action release_type camera_source_ref subject; do
+          while IFS=$'\t' read -r sha action release_target release_type camera_source_ref subject; do
             [ -n "$sha" ] || continue
             index=$((index + 1))
             short_sha="$(git rev-parse --short "$sha")"
-            if [ "$camera_source_ref" = "__default_branch__" ]; then
+            if [ "$release_target" = "ort" ]; then
+              camera_source_label="not used"
+            elif [ "$camera_source_ref" = "__default_branch__" ]; then
               camera_source_label="default branch"
             else
               camera_source_label="$camera_source_ref"
             fi
-            echo "$index. $short_sha | $action $release_type | app: $camera_source_label | $subject"
+            echo "$index. $short_sha | $action $release_target $release_type | app: $camera_source_label | $subject"
             if git diff-tree --no-commit-id --name-only -r "$sha" | grep -q '^.github/workflows/'; then
               echo "   touches .github/workflows/"
             fi
           done < "$OPERATIONS_PATH"
 
       - name: Set up Java
-        if: steps.collect_operations.outputs.has_operations == 'true'
+        if: steps.collect_operations.outputs.has_server_operations == 'true'
         uses: actions/setup-java@v5.2.0
         with:
           distribution: temurin
           java-version: "17"
 
       - name: Set up Android SDK
-        if: steps.collect_operations.outputs.has_operations == 'true'
+        if: steps.collect_operations.outputs.has_server_operations == 'true'
         uses: android-actions/setup-android@v4.0.1
         with:
           packages: "platform-tools platforms;android-34 build-tools;34.0.0"
 
       - name: Set up Gradle
-        if: steps.collect_operations.outputs.has_operations == 'true'
+        if: steps.collect_operations.outputs.has_server_operations == 'true'
         uses: gradle/actions/setup-gradle@v6.1.0
         with:
           gradle-version: "8.7"
@@ -515,20 +562,22 @@ jobs:
           }
 
           index=0
-          while IFS=$'\t' read -r sha action release_type camera_source_ref subject; do
+          while IFS=$'\t' read -r sha action release_target release_type camera_source_ref subject; do
             [ -n "$sha" ] || continue
             index=$((index + 1))
             short_sha="$(git rev-parse --short "$sha")"
             previous_tag="$(get_latest_tag)"
             calculate_next_version "$previous_tag" "$release_type"
             new_tag="$CALCULATED_TAG"
-            if [ "$camera_source_ref" = "__default_branch__" ]; then
+            if [ "$release_target" = "ort" ]; then
+              camera_source_label="not used"
+            elif [ "$camera_source_ref" = "__default_branch__" ]; then
               camera_source_label="default branch"
             else
               camera_source_label="$camera_source_ref"
             fi
 
-            echo "==> [$index/$total] $short_sha $action $release_type -> $new_tag"
+            echo "==> [$index/$total] $short_sha $action $release_target $release_type -> $new_tag"
             echo "    app source: $camera_source_label"
             echo "    $subject"
 
@@ -564,37 +613,51 @@ jobs:
             if ! (
               set -euo pipefail
               git worktree add --force --detach "$worktree_dir" "$sha"
-              if [ "$camera_source_ref" = "__default_branch__" ]; then
-                gh repo clone Nanboom233/skid-homework "$app_source_dir" -- --depth 1
-              else
-                gh repo clone Nanboom233/skid-homework "$app_source_dir" -- \
-                  --depth 1 \
-                  --branch "$camera_source_ref" \
-                  --single-branch
+              if [ "$release_target" != "ort" ]; then
+                if [ "$camera_source_ref" = "__default_branch__" ]; then
+                  gh repo clone Nanboom233/skid-homework "$app_source_dir" -- --depth 1
+                else
+                  gh repo clone Nanboom233/skid-homework "$app_source_dir" -- \
+                    --depth 1 \
+                    --branch "$camera_source_ref" \
+                    --single-branch
+                fi
               fi
               cd "$worktree_dir"
 
-              python -m pip install --upgrade pip -r requirements.txt
-              python .github/scripts/build_assets.py \
-                --asset-tag "$new_tag" \
-                --source-manifest asset-sources.json \
-                --work-dir work \
-                --dist-dir dist
+              if [ "$release_target" != "server" ]; then
+                python -m pip install --upgrade pip -r requirements.txt
+                python .github/scripts/build_assets.py \
+                  --asset-tag "$new_tag" \
+                  --source-manifest asset-sources.json \
+                  --work-dir work \
+                  --dist-dir dist
+              fi
 
-              gradle -p "$app_source_dir/server" -PassetVersion="$new_tag" clean assembleRelease
-              cp "$app_source_dir/server/build/outputs/apk/release/camera-server.jar" \
-                "dist/camera-server-${new_tag}.jar"
-              sha256sum "dist/camera-server-${new_tag}.jar" \
-                > "dist/camera-server-${new_tag}.jar.sha256"
+              if [ "$release_target" != "ort" ]; then
+                mkdir -p dist
+                gradle -p "$app_source_dir/server" -PassetVersion="$new_tag" clean assembleRelease
+                cp "$app_source_dir/server/build/outputs/apk/release/camera-server.jar" \
+                  "dist/camera-server-${new_tag}.jar"
+                sha256sum "dist/camera-server-${new_tag}.jar" \
+                  > "dist/camera-server-${new_tag}.jar.sha256"
+              fi
 
-              files=(
-                "dist/windows-directml-${new_tag}.zip"
-                "dist/windows-directml-${new_tag}.zip.sha256"
-                "dist/linux-tensorrt-cuda-${new_tag}.tar.gz"
-                "dist/linux-tensorrt-cuda-${new_tag}.tar.gz.sha256"
-                "dist/camera-server-${new_tag}.jar"
-                "dist/camera-server-${new_tag}.jar.sha256"
-              )
+              files=()
+              if [ "$release_target" != "server" ]; then
+                files+=(
+                  "dist/windows-directml-${new_tag}.zip"
+                  "dist/windows-directml-${new_tag}.zip.sha256"
+                  "dist/linux-tensorrt-cuda-${new_tag}.tar.gz"
+                  "dist/linux-tensorrt-cuda-${new_tag}.tar.gz.sha256"
+                )
+              fi
+              if [ "$release_target" != "ort" ]; then
+                files+=(
+                  "dist/camera-server-${new_tag}.jar"
+                  "dist/camera-server-${new_tag}.jar.sha256"
+                )
+              fi
               for file in "${files[@]}"; do
                 if [ ! -f "$file" ]; then
                   echo "Expected release artifact was not produced: $file" >&2
@@ -605,10 +668,13 @@ jobs:
               cat > release-notes.md <<EOF
           Scanner assets ${new_tag}
 
+          Release target: ${release_target}
           Assets source: ${GITHUB_REPOSITORY}@${sha}
-          Camera server source: Nanboom233/skid-homework@${camera_source_label}
           Trigger commit: ${subject}
           EOF
+              if [ "$release_target" != "ort" ]; then
+                echo "Camera server source: Nanboom233/skid-homework@${camera_source_label}" >> release-notes.md
+              fi
 
               prerelease_args=()
               if [ "$action" = "pre-release" ]; then
